@@ -87,21 +87,34 @@ func restoreSingleTableData(fpInfo *filepath.FilePathInfo, entry toc.Coordinator
 			defer connectionPool.MustExec("RESET gp_enable_segment_copy_checking;", whichConn)
 		}
 
-		partialRowsRestored, err := CopyTableIn(connectionPool, tableName, entry.AttributeString, destinationToRead, backupConfig.SingleDataFile, whichConn)
-		if err != nil {
-			gplog.Error(err.Error())
+		partialRowsRestored, copyErr := CopyTableIn(connectionPool, tableName, entry.AttributeString, destinationToRead, backupConfig.SingleDataFile, whichConn)
+		// In the case where an error file is found, this means that the
+		// restore_helper has encountered an error and has shutdown. This
+		// needs to be checked before the loop can continue because of
+		// on-error-continue.
+		if backupConfig.SingleDataFile {
+			agentErr := utils.CheckAgentErrorsOnSegments(globalCluster, globalFPInfo)
+			if agentErr != nil {
+				gplog.Error(agentErr.Error())
+				return agentErr
+			}
+		}
+
+		if copyErr != nil {
+			gplog.Error(copyErr.Error())
 			if MustGetFlagBool(options.ON_ERROR_CONTINUE) {
 				if connectionPool.Version.AtLeast("6") && backupConfig.SingleDataFile {
 					// inform segment helpers to skip this entry
 					utils.CreateSkipFileOnSegments(fmt.Sprintf("%d", entry.Oid), tableName, globalCluster, globalFPInfo)
 				}
-				lastErr = err
-				err = nil
+				lastErr = copyErr
+				copyErr = nil
 				continue
 			}
-			return err
+			return copyErr
 		}
 		numRowsRestored += partialRowsRestored
+
 	}
 	if lastErr != nil {
 		return lastErr
@@ -286,14 +299,6 @@ func restoreDataFromTimestamp(fpInfo filepath.FilePathInfo, dataEntries []toc.Co
 						gplog.Verbose("Restored data to table %s from file (table %d of %d)", tableName, atomic.AddInt64(&tableNum, 1), totalTables)
 					} else {
 						gplog.Verbose("Restored data to table %s from file", tableName)
-					}
-				}
-
-				if backupConfig.SingleDataFile {
-					agentErr := utils.CheckAgentErrorsOnSegments(globalCluster, globalFPInfo)
-					if agentErr != nil {
-						gplog.Error(agentErr.Error())
-						return
 					}
 				}
 
